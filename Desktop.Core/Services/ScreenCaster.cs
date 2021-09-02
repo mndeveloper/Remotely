@@ -14,15 +14,19 @@ using System.Drawing.Imaging;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using System.ComponentModel.DataAnnotations;
 
 namespace Remotely.Desktop.Core.Services
 {
+    public interface IScreenCaster
+    {
+        void BeginScreenCasting(ScreenCastRequest screenCastRequest);
+    }
+
     public class ScreenCaster : IScreenCaster
     {
         private readonly Conductor _conductor;
         private readonly ICursorIconWatcher _cursorIconWatcher;
-        private readonly int _maxQuality = 75;
-        private readonly int _minQuality = 10;
         private readonly ISessionIndicator _sessionIndicator;
         private readonly IShutdownService _shutdownService;
 
@@ -38,17 +42,18 @@ namespace Remotely.Desktop.Core.Services
         }
 
 
-        public async Task BeginScreenCasting(ScreenCastRequest screenCastRequest)
+        public void BeginScreenCasting(ScreenCastRequest screenCastRequest)
+        {
+            _ = Task.Run(async () => await CastScreen(screenCastRequest));
+        }
+
+        private async Task CastScreen(ScreenCastRequest screenCastRequest)
         {
             try
             {
-                var sendFramesLock = new SemaphoreSlim(1, 1);
-                var refreshTimer = Stopwatch.StartNew();
-                var refreshNeeded = false;
-                var currentQuality = _maxQuality;
                 Bitmap currentFrame = null;
                 Bitmap previousFrame = null;
-                var sw = Stopwatch.StartNew();
+                long sequence = 0;
 
                 var viewer = ServiceContainer.Instance.GetRequiredService<Viewer>();
                 viewer.Name = screenCastRequest.RequesterName;
@@ -73,11 +78,11 @@ namespace Remotely.Desktop.Core.Services
 
                 await viewer.SendViewerConnected();
 
-                await viewer.SendMachineName(Environment.MachineName);
-
                 await viewer.SendScreenData(
-                       viewer.Capturer.SelectedScreen,
-                       viewer.Capturer.GetDisplayNames().ToArray());
+                    viewer.Capturer.SelectedScreen,
+                    viewer.Capturer.GetDisplayNames(),
+                    screenBounds.Width,
+                    screenBounds.Height);
 
                 await viewer.SendScreenSize(screenBounds.Width, screenBounds.Height);
 
@@ -96,11 +101,12 @@ namespace Remotely.Desktop.Core.Services
                     {
                         await viewer.SendScreenCapture(new CaptureFrame()
                         {
-                            EncodedImageBytes = ImageUtils.EncodeJpeg(initialFrame, _maxQuality),
+                            EncodedImageBytes = ImageUtils.EncodeJpeg(initialFrame),
                             Left = screenBounds.Left,
                             Top = screenBounds.Top,
                             Width = screenBounds.Width,
-                            Height = screenBounds.Height
+                            Height = screenBounds.Height,
+                            Sequence = sequence++
                         });
                     }
                 }
@@ -118,14 +124,12 @@ namespace Remotely.Desktop.Core.Services
                 {
                     try
                     {
-                        TaskHelper.DelayUntil(() => sw.Elapsed.TotalMilliseconds > 40, TimeSpan.FromSeconds(5));
-                        sw.Restart();
-
                         if (viewer.IsUsingWebRtcVideo)
                         {
                             Thread.Sleep(100);
                             continue;
                         }
+
                         if (viewer.IsStalled)
                         {
                             // Viewer isn't responding.  Abort sending.
@@ -133,7 +137,9 @@ namespace Remotely.Desktop.Core.Services
                             break;
                         }
 
-                        viewer.ThrottleIfNeeded();
+                        viewer.CalculateFps();
+
+                        viewer.ApplyAutoQuality();
 
                         if (currentFrame != null)
                         {
@@ -149,12 +155,6 @@ namespace Remotely.Desktop.Core.Services
                             continue;
                         }
 
-                        if (refreshNeeded && refreshTimer.Elapsed.TotalSeconds > 5)
-                        {
-                            viewer.Capturer.CaptureFullscreen = true;
-                        }
-
-
                         var diffArea = ImageUtils.GetDiffArea(currentFrame, previousFrame, viewer.Capturer.CaptureFullscreen);
 
                         if (diffArea.IsEmpty)
@@ -162,49 +162,23 @@ namespace Remotely.Desktop.Core.Services
                             continue;
                         }
 
-                        
-                        if (viewer.Capturer.CaptureFullscreen)
-                        {
-                            refreshTimer.Restart();
-                            refreshNeeded = false;
-                        }
+                        viewer.Capturer.CaptureFullscreen = false;
+
+                        using var croppedFrame = currentFrame.Clone(diffArea, currentFrame.PixelFormat);
 
                         byte[] encodedImageBytes;
-                        if (viewer.Capturer.CaptureFullscreen)
+
+                        if (viewer.ImageQuality == Viewer.DefaultQuality)
                         {
-                            // Recalculate Bps.
-                            viewer.AverageBytesPerSecond = 0;
-                            encodedImageBytes = ImageUtils.EncodeJpeg(currentFrame, _maxQuality);
+                            encodedImageBytes = ImageUtils.EncodeJpeg(croppedFrame);
                         }
                         else
                         {
-                            if (!viewer.AutoQuality)
-                            {
-                                currentQuality = _maxQuality;
-                            }
-                            else if (viewer.AverageBytesPerSecond > 0)
-                            {
-                                var expectedSize = diffArea.Height * diffArea.Width * 4 * .1;
-                                var timeToSend = expectedSize / viewer.AverageBytesPerSecond;
-                                currentQuality = Math.Max(_minQuality, Math.Min(_maxQuality, (int)(.1 / timeToSend * _maxQuality)));
-                                if (currentQuality < _maxQuality - 5)
-                                {
-                                    refreshNeeded = true;
-                                    Debug.WriteLine($"Quality Reduced: {currentQuality}");
-                                }
-                            }
-
-                            using var clone = currentFrame.Clone(diffArea, currentFrame.PixelFormat);
-                            //var resizeW = diffArea.Width * currentQuality / _maxQuality;
-                            //var resizeH = diffArea.Height * currentQuality / _maxQuality;
-                            //using var resized = new Bitmap(clone, new Size(resizeW, resizeH));
-                            encodedImageBytes = ImageUtils.EncodeJpeg(clone, currentQuality);
+                            encodedImageBytes = ImageUtils.EncodeJpeg(croppedFrame, viewer.ImageQuality);
                         }
 
-                        viewer.Capturer.CaptureFullscreen = false;
+                        await SendFrame(encodedImageBytes, diffArea, sequence++, viewer);
 
-                        await sendFramesLock.WaitAsync();
-                        SendFrame(encodedImageBytes, diffArea, viewer, sendFramesLock);
                     }
                     catch (Exception ex)
                     {
@@ -237,32 +211,21 @@ namespace Remotely.Desktop.Core.Services
             }
         }
 
-        private static void SendFrame(byte[] encodedImageBytes, Rectangle diffArea, Viewer viewer, SemaphoreSlim sendFramesLock)
+        private static async Task SendFrame(byte[] encodedImageBytes, Rectangle diffArea, long sequence, Viewer viewer)
         {
-            _ = Task.Run(async () =>
+            if (encodedImageBytes.Length == 0)
             {
-                try
-                {
+                return;
+            }
 
-                    if (encodedImageBytes.Length == 0)
-                    {
-                        return;
-                    }
-
-                    await viewer.SendScreenCapture(new CaptureFrame()
-                    {
-                        EncodedImageBytes = encodedImageBytes,
-                        Top = diffArea.Top,
-                        Left = diffArea.Left,
-                        Width = diffArea.Width,
-                        Height = diffArea.Height,
-                    });
-
-                }
-                finally
-                {
-                    sendFramesLock.Release();
-                }
+            await viewer.SendScreenCapture(new CaptureFrame()
+            {
+                EncodedImageBytes = encodedImageBytes,
+                Top = diffArea.Top,
+                Left = diffArea.Left,
+                Width = diffArea.Width,
+                Height = diffArea.Height,
+                Sequence = sequence
             });
         }
     }

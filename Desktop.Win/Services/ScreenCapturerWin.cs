@@ -82,42 +82,66 @@ namespace Remotely.Desktop.Win.Services
         {
             lock (_screenBoundsLock)
             {
-                try
+                Bitmap returnFrame = null;
+                var frameCompletedEvent = new ManualResetEventSlim();
+
+                // This is necessary to ensure SwitchToInputDesktop works.  Threads
+                // that have hooks in the current desktop will not succeed.
+                var captureThread = new Thread(() =>
                 {
-
-                    Win32Interop.SwitchToInputDesktop();
-
-                    if (NeedsInit)
+                    try
                     {
-                        Logger.Write("Init needed in GetNextFrame.");
-                        Init();
-                    }
-                    
-                    // Sometimes DX will result in a timeout, even when there are changes
-                    // on the screen.  I've observed this when a laptop lid is closed, or
-                    // on some machines that aren't connected to a monitor.  This will
-                    // have it fall back to BitBlt in those cases.
-                    // TODO: Make DX capture work with changed screen orientation.
-                    if (_directxScreens.TryGetValue(SelectedScreen, out var dxDisplay) &&
-                        dxDisplay.Rotation == DisplayModeRotation.Identity)
-                    {
-                        var (result, frame) = GetDirectXFrame();
+                        Win32Interop.SwitchToInputDesktop();
 
-                        if (result == GetDirectXFrameResult.Success)
+                        if (NeedsInit)
                         {
-                            return frame;
+                            Logger.Write("Init needed in GetNextFrame.");
+                            Init();
+                            NeedsInit = false;
                         }
+
+                        // Sometimes DX will result in a timeout, even when there are changes
+                        // on the screen.  I've observed this when a laptop lid is closed, or
+                        // on some machines that aren't connected to a monitor.  This will
+                        // have it fall back to BitBlt in those cases.
+                        // TODO: Make DX capture work with changed screen orientation.
+                        if (_directxScreens.TryGetValue(SelectedScreen, out var dxDisplay) &&
+                            dxDisplay.Rotation == DisplayModeRotation.Identity)
+                        {
+                            var (result, frame) = GetDirectXFrame();
+
+                            if (result == GetDirectXFrameResult.Timeout)
+                            {
+                                return;
+                            }
+
+                            if (result == GetDirectXFrameResult.Success)
+                            {
+                                returnFrame = frame;
+                                return;
+                            }
+                        }
+
+                        returnFrame = GetBitBltFrame();
+
                     }
+                    catch (Exception e)
+                    {
+                        Logger.Write(e);
+                        NeedsInit = true;
+                    }
+                    finally
+                    {
+                        frameCompletedEvent.Set();
+                    }
+                });
 
-                    return GetBitBltFrame();
+                captureThread.SetApartmentState(ApartmentState.STA);
+                captureThread.Start();
 
-                }
-                catch (Exception e)
-                {
-                    Logger.Write(e);
-                    NeedsInit = true;
-                }
-                return null;
+                frameCompletedEvent.Wait();
+
+                return returnFrame;
             }
 
         }
@@ -209,7 +233,7 @@ namespace Remotely.Desktop.Win.Services
                 var texture2D = _directxScreens[SelectedScreen].Texture2D;
 
                 // Try to get duplicated frame within given time is ms
-                var result = duplicatedOutput.TryAcquireNextFrame(100,
+                var result = duplicatedOutput.TryAcquireNextFrame(500,
                     out var duplicateFrameInformation,
                     out var screenResource);
 
@@ -275,22 +299,32 @@ namespace Remotely.Desktop.Win.Services
             }
             catch (SharpDXException e)
             {
-                if (e.ResultCode.Code != SharpDX.DXGI.ResultCode.WaitTimeout.Result.Code)
+                if (e.ResultCode.Code == SharpDX.DXGI.ResultCode.WaitTimeout.Code)
                 {
-                    Logger.Write(e);
-                    NeedsInit = true;
-                    return (GetDirectXFrameResult.Failure, null);
+                    return (GetDirectXFrameResult.Timeout, null);
                 }
-                return (GetDirectXFrameResult.Timeout, null);
+                Logger.Write(e, "SharpDXException error.");
             }
+            catch (Exception ex)
+            {
+                Logger.Write(ex);
+            }
+            return (GetDirectXFrameResult.Failure, null);
         }
 
         private void InitBitBlt()
         {
-            _bitBltScreens.Clear();
-            for (var i = 0; i < Screen.AllScreens.Length; i++)
+            try
             {
-                _bitBltScreens.Add(Screen.AllScreens[i].DeviceName, i);
+                _bitBltScreens.Clear();
+                for (var i = 0; i < Screen.AllScreens.Length; i++)
+                {
+                    _bitBltScreens.Add(Screen.AllScreens[i].DeviceName, i);
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Write(ex);
             }
         }
 
@@ -300,56 +334,51 @@ namespace Remotely.Desktop.Win.Services
             {
                 ClearDirectXOutputs();
 
-                using (var factory = new Factory1())
+                using var factory = new Factory1();
+                foreach (var adapter in factory.Adapters1.Where(x => (x.Outputs?.Length ?? 0) > 0))
                 {
-                    foreach (var adapter in factory.Adapters1.Where(x => (x.Outputs?.Length ?? 0) > 0))
+                    foreach (var output in adapter.Outputs)
                     {
-                        foreach (var output in adapter.Outputs)
+                        try
                         {
-                            try
+                            var device = new SharpDX.Direct3D11.Device(adapter);
+                            var output1 = output.QueryInterface<Output1>();
+
+                            var bounds = output1.Description.DesktopBounds;
+                            var width = bounds.Right - bounds.Left;
+                            var height = bounds.Bottom - bounds.Top;
+
+                            // Create Staging texture CPU-accessible
+                            var textureDesc = new Texture2DDescription
                             {
-                                var device = new SharpDX.Direct3D11.Device(adapter);
-                                var output1 = output.QueryInterface<Output1>();
+                                CpuAccessFlags = CpuAccessFlags.Read,
+                                BindFlags = BindFlags.None,
+                                Format = Format.B8G8R8A8_UNorm,
+                                Width = width,
+                                Height = height,
+                                OptionFlags = ResourceOptionFlags.None,
+                                MipLevels = 1,
+                                ArraySize = 1,
+                                SampleDescription = { Count = 1, Quality = 0 },
+                                Usage = ResourceUsage.Staging
+                            };
 
-                                var bounds = output1.Description.DesktopBounds;
-                                var width = bounds.Right - bounds.Left;
-                                var height = bounds.Bottom - bounds.Top;
+                            var texture2D = new Texture2D(device, textureDesc);
 
-                                // Create Staging texture CPU-accessible
-                                var textureDesc = new Texture2DDescription
-                                {
-                                    CpuAccessFlags = CpuAccessFlags.Read,
-                                    BindFlags = BindFlags.None,
-                                    Format = Format.B8G8R8A8_UNorm,
-                                    Width = width,
-                                    Height = height,
-                                    OptionFlags = ResourceOptionFlags.None,
-                                    MipLevels = 1,
-                                    ArraySize = 1,
-                                    SampleDescription = { Count = 1, Quality = 0 },
-                                    Usage = ResourceUsage.Staging
-                                };
-
-                                var texture2D = new Texture2D(device, textureDesc);
-
-                                _directxScreens.Add(
-                                    output1.Description.DeviceName,
-                                    new DirectXOutput(adapter,
-                                        device,
-                                        output1.DuplicateOutput(device),
-                                        texture2D,
-                                        output1.Description.Rotation));
-                            }
-                            catch (Exception ex)
-                            {
-                                Logger.Write(ex);
-                            }
+                            _directxScreens.Add(
+                                output1.Description.DeviceName,
+                                new DirectXOutput(adapter,
+                                    device,
+                                    output1.DuplicateOutput(device),
+                                    texture2D,
+                                    output1.Description.Rotation));
+                        }
+                        catch (Exception ex)
+                        {
+                            Logger.Write(ex);
                         }
                     }
                 }
-
-
-                NeedsInit = false;
             }
             catch (Exception ex)
             {

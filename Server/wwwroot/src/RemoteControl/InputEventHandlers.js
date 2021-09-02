@@ -1,4 +1,4 @@
-import { AudioButton, ChangeScreenButton, HorizontalBars, ScreenSelectBar, ClipboardTransferButton, ClipboardTransferBar, TypeClipboardButton, ConnectButton, CtrlAltDelButton, DisconnectButton, FileTransferButton, FileTransferInput, FitToScreenButton, ScreenViewer, BlockInputButton, InviteButton, KeyboardButton, TouchKeyboardTextArea, MenuFrame, MenuButton, ScreenViewerWrapper, WindowsSessionSelect, RecordSessionButton, DownloadRecordingButton, VideoScreenViewer, StreamVideoButton, FileTransferBar, FileUploadButtton, FileDownloadButton, UpdateStreamingToggled, ViewOnlyButton, FullScreenButton, AutoQualityButton } from "./UI.js";
+import { AudioButton, ChangeScreenButton, HorizontalBars, ScreenSelectBar, ClipboardTransferButton, ClipboardTransferBar, TypeClipboardButton, ConnectButton, CtrlAltDelButton, DisconnectButton, FileTransferButton, FileTransferInput, FitToScreenButton, ScreenViewer, BlockInputButton, InviteButton, KeyboardButton, TouchKeyboardTextArea, MenuFrame, MenuButton, ScreenViewerWrapper, WindowsSessionSelect, RecordSessionButton, DownloadRecordingButton, VideoScreenViewer, StreamVideoButton, FileTransferBar, FileUploadButtton, FileDownloadButton, UpdateStreamingToggled, ViewOnlyButton, FullScreenButton } from "./UI.js";
 import { Sound } from "./Sound.js";
 import { ViewerApp } from "./App.js";
 import { UploadFiles } from "./FileTransferService.js";
@@ -6,7 +6,6 @@ import { RemoteControlMode } from "./Enums/RemoteControlMode.js";
 import { GetDistanceBetween } from "./Utilities.js";
 import { ShowMessage } from "./UI.js";
 import { SetSettings } from "./SettingsService.js";
-var lastPointerMove = Date.now();
 var isDragging;
 var currentPointerDevice;
 var currentTouchCount;
@@ -28,13 +27,6 @@ export function ApplyInputHandlers() {
             Sound.Init();
         }
         ViewerApp.MessageSender.SendToggleAudio(toggleOn);
-    });
-    AutoQualityButton.addEventListener("click", (ev) => {
-        AutoQualityButton.classList.toggle("toggled");
-        var toggleOn = AutoQualityButton.classList.contains("toggled");
-        ViewerApp.Settings.autoQuality = toggleOn;
-        SetSettings(ViewerApp.Settings);
-        ViewerApp.MessageSender.SendToggleAutoQuality(toggleOn);
     });
     ChangeScreenButton.addEventListener("click", (ev) => {
         closeAllHorizontalBars("screenSelectBar");
@@ -148,7 +140,7 @@ export function ApplyInputHandlers() {
             url = `${location.origin}${location.pathname}?sessionID=${ViewerApp.CasterID}`;
         }
         else {
-            url = `${location.origin}${location.pathname}?clientID=${ViewerApp.CasterID}&serviceID=${ViewerApp.ServiceID}`;
+            url = `${location.origin}${location.pathname}?casterID=${ViewerApp.CasterID}&serviceID=${ViewerApp.ServiceID}`;
         }
         ViewerApp.ClipboardWatcher.SetClipboardText(url);
         ShowMessage("Link copied to clipboard.");
@@ -203,10 +195,6 @@ export function ApplyInputHandlers() {
             if (ViewerApp.ViewOnlyMode) {
                 return;
             }
-            if (Date.now() - lastPointerMove < 25) {
-                return;
-            }
-            lastPointerMove = Date.now();
             var percentX = e.offsetX / viewer.clientWidth;
             var percentY = e.offsetY / viewer.clientHeight;
             ViewerApp.MessageSender.SendMouseMove(percentX, percentY);

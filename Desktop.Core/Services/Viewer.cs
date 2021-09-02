@@ -14,14 +14,18 @@ using System.Threading.Tasks;
 using System.Text.Json;
 using System.Threading;
 using System.Diagnostics;
+using System.Collections;
+using System.Collections.Generic;
 
 namespace Remotely.Desktop.Core.Services
 {
     public class Viewer : IDisposable
     {
-        private long _bytesSent;
-        private TimeSpan _timeSpentSending = TimeSpan.Zero;
+        public const int DefaultQuality = 75;
+        private const int MinQuality = 20;
 
+        private readonly ConcurrentQueue<DateTimeOffset> _fpsQueue = new();
+        private readonly ConcurrentQueue<SentFrame> _receivedFrames = new();
         public Viewer(ICasterSocket casterSocket,
             IScreenCapturer screenCapturer,
             IClipboardService clipboardService,
@@ -36,13 +40,12 @@ namespace Remotely.Desktop.Core.Services
             AudioCapturer = audioCapturer;
             AudioCapturer.AudioSampleReady += AudioCapturer_AudioSampleReady;
         }
-
         public IScreenCapturer Capturer { get; }
-
+        public double CurrentFps { get; private set; }
+        public double CurrentMbps { get; private set; }
         public bool DisconnectRequested { get; set; }
-        public EncoderParameters EncoderParams { get; private set; }
         public bool HasControl { get; set; } = true;
-        public bool AutoQuality { get; set; } = true;
+        public int ImageQuality { get; private set; } = DefaultQuality;
         public bool IsConnected => CasterSocket.IsConnected;
 
         public bool IsStalled
@@ -70,10 +73,8 @@ namespace Remotely.Desktop.Core.Services
         }
 
         public string Name { get; set; }
-
-        public double AverageBytesPerSecond { get; set; }
         public ConcurrentQueue<SentFrame> PendingSentFrames { get; } = new();
-
+        public TimeSpan RoundTripLatency { get; private set; }
         public WebRtcSession RtcSession { get; set; }
 
         public string ViewerConnectionID { get; set; }
@@ -85,6 +86,63 @@ namespace Remotely.Desktop.Core.Services
         private IClipboardService ClipboardService { get; }
 
         private IWebRtcSessionFactory WebRtcSessionFactory { get; }
+
+        public void ApplyAutoQuality()
+        {
+            if (ImageQuality < DefaultQuality)
+            {
+                ImageQuality = Math.Min(DefaultQuality, ImageQuality + 2);
+            }
+
+            // Limit to 20 FPS.
+            _ = TaskHelper.DelayUntil(() =>
+                !PendingSentFrames.TryPeek(out var result) || DateTimeOffset.Now - result.Timestamp > TimeSpan.FromMilliseconds(50),
+                TimeSpan.FromSeconds(5));
+
+            // Delay based on roundtrip time to prevent too many frames from queuing up on slow connections.
+            _ = TaskHelper.DelayUntil(() => PendingSentFrames.Count < 1 / RoundTripLatency.TotalSeconds,
+                TimeSpan.FromSeconds(5));
+
+            // Wait until oldest pending frame is within the past 1 second.
+            _ = TaskHelper.DelayUntil(() =>
+                !PendingSentFrames.TryPeek(out var result) || DateTimeOffset.Now - result.Timestamp < TimeSpan.FromSeconds(1),
+                TimeSpan.FromSeconds(5));
+
+
+            Debug.WriteLine(
+                $"Current Mbps: {CurrentMbps}.  " +
+                $"Current FPS: {CurrentFps}.  " +
+                $"Roundtrip Latency: {RoundTripLatency}.  " +
+                $"Image Quality: {ImageQuality}");
+        }
+
+        public void CalculateFps()
+        {
+            _fpsQueue.Enqueue(Time.Now);
+
+            while (_fpsQueue.TryPeek(out var oldestTime) &&
+                Time.Now - oldestTime > TimeSpan.FromSeconds(1))
+            {
+                _fpsQueue.TryDequeue(out _);
+            }
+
+            CurrentFps = _fpsQueue.Count;
+        }
+
+        public void DequeuePendingFrame()
+        {
+            if (PendingSentFrames.TryDequeue(out var frame))
+            {
+                RoundTripLatency = Time.Now - frame.Timestamp;
+                _receivedFrames.Enqueue(new SentFrame(frame.FrameSize));
+            }
+            while (_receivedFrames.TryPeek(out var oldestFrame) &&
+                Time.Now - oldestFrame.Timestamp > TimeSpan.FromSeconds(1))
+            {
+                _receivedFrames.TryDequeue(out _);
+            }
+            CurrentMbps = (double)_receivedFrames.Sum(x => x.FrameSize) / 1024 / 1024 * 8;
+        }
 
         public void Dispose()
         {
@@ -153,7 +211,6 @@ namespace Remotely.Desktop.Core.Services
             await SendToViewer(() => RtcSession.SendDto(dto),
                 () => CasterSocket.SendDtoToViewer(dto, ViewerConnectionID));
         }
-
         public async Task SendFile(FileUpload fileUpload, CancellationToken cancelToken, Action<double> progressUpdateCallback)
         {
             try
@@ -212,69 +269,63 @@ namespace Remotely.Desktop.Core.Services
             }
         }
 
-        public async Task SendMachineName(string machineName)
-        {
-            var dto = new MachineNameDto(machineName);
-            await SendToViewer(() => RtcSession.SendDto(dto),
-                () => CasterSocket.SendDtoToViewer(dto, ViewerConnectionID));
-        }
-
         public async Task SendScreenCapture(CaptureFrame screenFrame)
         {
-            PendingSentFrames.Enqueue(new SentFrame(DateTimeOffset.Now, screenFrame.EncodedImageBytes.Length));
+            
+            PendingSentFrames.Enqueue(new SentFrame(screenFrame.EncodedImageBytes.Length));
 
             var left = screenFrame.Left;
             var top = screenFrame.Top;
             var width = screenFrame.Width;
             var height = screenFrame.Height;
 
-            var sw = Stopwatch.StartNew();
-
             for (var i = 0; i < screenFrame.EncodedImageBytes.Length; i += 50_000)
             {
                 var dto = new CaptureFrameDto()
                 {
-                    Id = screenFrame.Id,
                     Left = left,
                     Top = top,
                     Width = width,
                     Height = height,
                     EndOfFrame = false,
+                    Sequence = screenFrame.Sequence,
                     ImageBytes = screenFrame.EncodedImageBytes.Skip(i).Take(50_000).ToArray()
                 };
 
-                await SendToViewer(() => RtcSession.SendDto(dto),
-                    () => CasterSocket.SendDtoToViewer(dto, ViewerConnectionID));
+                await SendToViewer(
+                      () => RtcSession.SendDto(dto),
+                      () => CasterSocket.SendDtoToViewer(dto, ViewerConnectionID));
             }
 
             var endOfFrameDto = new CaptureFrameDto()
             {
-                Id = screenFrame.Id,
                 Left = left,
                 Top = top,
                 Width = width,
                 Height = height,
-                EndOfFrame = true
+                EndOfFrame = true,
+                Sequence = screenFrame.Sequence,
             };
 
             await SendToViewer(
-                () => RtcSession.SendDto(endOfFrameDto),
-                () => CasterSocket.SendDtoToViewer(endOfFrameDto, ViewerConnectionID));
-
-            sw.Stop();
-
-            _bytesSent += screenFrame.EncodedImageBytes.Length;
-            _timeSpentSending += sw.Elapsed;
-
-
-            AverageBytesPerSecond = _bytesSent / _timeSpentSending.TotalSeconds;
-
-            Debug.WriteLine($"Mbps: {AverageBytesPerSecond / 1024 / 1024 * 8}");
+                       () => RtcSession.SendDto(endOfFrameDto),
+                       () => CasterSocket.SendDtoToViewer(endOfFrameDto, ViewerConnectionID));
         }
 
-        public async Task SendScreenData(string selectedScreen, string[] displayNames)
+        public async Task SendScreenData(
+            string selectedDisplay, 
+            IEnumerable<string> displayNames,
+            int screenWidth,
+            int screenHeight)
         {
-            var dto = new ScreenDataDto(selectedScreen, displayNames);
+            var dto = new ScreenDataDto()
+            {
+                MachineName = Environment.MachineName,
+                DisplayNames = displayNames,
+                SelectedDisplay = selectedDisplay,
+                ScreenWidth = screenWidth,
+                ScreenHeight = screenHeight
+            };
             await SendToViewer(() => RtcSession.SendDto(dto),
                 () => CasterSocket.SendDtoToViewer(dto, ViewerConnectionID));
         }
@@ -290,6 +341,7 @@ namespace Remotely.Desktop.Core.Services
         {
             await CasterSocket.SendViewerConnected(ViewerConnectionID);
         }
+
         public async Task SendWindowsSessions()
         {
             if (EnvironmentHelper.IsWindows)
@@ -299,14 +351,6 @@ namespace Remotely.Desktop.Core.Services
                     () => CasterSocket.SendDtoToViewer(dto, ViewerConnectionID));
             }
         }
-
-        public void ThrottleIfNeeded()
-        {
-            TaskHelper.DelayUntil(() =>
-                !PendingSentFrames.TryPeek(out var result) || DateTimeOffset.Now - result.Timestamp < TimeSpan.FromSeconds(1),
-                TimeSpan.FromSeconds(10));
-        }
-
         public void ToggleWebRtcVideo(bool toggleOn)
         {
             RtcSession.ToggleWebRtcVideo(toggleOn);
