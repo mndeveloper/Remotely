@@ -63,6 +63,7 @@ namespace Remotely.Server
             }
             else if (dbProvider == "postgresql")
             {
+                AppContext.SetSwitch("Npgsql.EnableLegacyTimestampBehavior", true);
                 services.AddDbContext<AppDb, PostgreSqlDbContext>(options =>
                 {
                     // Password should be set in User Secrets in dev environment.
